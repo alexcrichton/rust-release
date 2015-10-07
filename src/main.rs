@@ -4,11 +4,12 @@ extern crate rustc_serialize;
 
 use std::str;
 use std::env;
+use std::fs::{self, File};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use curl::http::{Handle, Request};
+use curl::http::{Handle, Request, Response};
 use rustc_serialize::{json, Decodable, Encodable};
 
 macro_rules! t {
@@ -16,6 +17,14 @@ macro_rules! t {
         Ok(e) => e,
         Err(e) => panic!("{} failed with {}", stringify!($e), e),
     })
+}
+
+#[derive(RustcDecodable)]
+struct Release {
+    id: u64,
+    name: String,
+    upload_url: String,
+    assets_url: String,
 }
 
 fn main() {
@@ -59,7 +68,7 @@ fn main() {
     //     panic!("unknown host: {}", host);
     // }
 
-    publish(&project, &repo, &token);
+    publish(&project, &repo, &token, host);
 }
 
 fn usage(opts: &getopts::Options) {
@@ -92,33 +101,97 @@ fn build_macos(project: &Path) {
     run(&mut cmd);
 }
 
-fn publish(project: &Path, repo: &str, token: &str) {
+fn publish(project: &Path, repo: &str, token: &str, host: &str) {
     let mut handle = Handle::new();
     let release = get_release(&mut handle, repo, token);
-    println!("release: {}", release);
+
+    let sha = t!(Command::new("git").arg("rev-parse").arg("HEAD").output());
+    let sha = t!(String::from_utf8(sha.stdout));
+
+    update_release(&mut handle, &release, repo, token, sha.trim());
+    println!("release: {}", release.id);
+    handle = Handle::new(); // ... why? otherwise listing assets fails...
+
+    for file in t!(fs::read_dir(project.join("target/release"))) {
+        let file = t!(file);
+        if !t!(file.file_type()).is_file() {
+            continue
+        }
+        upload(&mut handle, &release, repo, token, host, &file.path());
+    }
 }
 
-fn get_release(handle: &mut Handle, repo: &str, token: &str) -> u64 {
-    #[derive(RustcDecodable)]
-    struct Release {
-        id: u64,
-        name: String,
-    }
+fn get_release(handle: &mut Handle, repo: &str, token: &str) -> Release {
     let url = format!("https://api.github.com/repos/{}/releases", repo);
     let releases: Vec<Release> = json(handle.get(&url[..]), token);
     for release in releases {
         if release.name == "master" {
-            return release.id
+            return release
         }
     }
 
     #[derive(RustcEncodable)]
     struct Create {
         tag_name: String,
+        name: String,
+        draft: bool,
     }
-    send::<_, Release>(handle, &url, token, &Create {
-        tag_name: "master".to_string()
-    }).id
+    let body = t!(json::encode(&Create {
+        tag_name: "master".to_string(),
+        name: "master".to_string(),
+        draft: true,
+    }));
+    let r: Release = json(handle.post(&url[..], &body), token);
+    return r
+}
+
+fn update_release(handle: &mut Handle, release: &Release, repo: &str,
+                  token: &str, sha: &str) {
+    #[derive(RustcEncodable)]
+    struct Update {
+        target_commitish: String,
+        draft: bool,
+    }
+    let url = format!("https://api.github.com/repos/{}/releases/{}", repo,
+                      release.id);
+    let body = t!(json::encode(&Update {
+        target_commitish: sha.to_string(),
+        draft: false,
+    }));
+    json::<Release>(handle.patch(&url[..], &body), token);
+}
+
+fn upload(handle: &mut Handle, release: &Release, repo: &str, token: &str,
+          host: &str, path: &Path) {
+    #[derive(RustcDecodable)]
+    struct Asset {
+        id: u64,
+        name: String,
+        label: String,
+    }
+    println!("fetching assets: {:?}", release.assets_url);
+    let v: Vec<Asset> = json(handle.get(&release.assets_url[..]), token);
+    let stem = path.file_stem().unwrap().to_str().unwrap();
+    let filename = format!("{}-{}{}", stem, host, env::consts::EXE_SUFFIX);
+    for asset in v {
+        if asset.name == filename {
+            let url = format!("https://api.github.com/repos/{}/releases/assets/{}",
+                              repo, asset.id);
+            println!("deleting previous asset: {}", url);
+            exec(handle.delete(&url[..]), token);
+            break
+        }
+    }
+
+    let mut file = File::open(path).unwrap();
+    let meta = fs::metadata(path).unwrap();
+    let upload_url = &release.upload_url[..release.upload_url.find("{").unwrap()];
+    let url = format!("{}?name={}", upload_url, filename);
+    println!("upload to: {}", url);
+    let req = handle.post(&url[..], &mut file)
+                    .content_length(meta.len() as usize);
+    json::<Asset>(req.header("Content-Type", "application/octet-stream"), token);
+
 }
 
 fn flagorenv(matches: &getopts::Matches, flag: &str, env: &[&str]) -> String {
@@ -139,21 +212,19 @@ fn run(cmd: &mut Command) {
     assert!(status.success());
 }
 
-fn send<T, U>(handle: &mut Handle, url: &str, token: &str, t: &T) -> U
-    where T: Encodable, U: Decodable
-{
-    let body = t!(json::encode(t));
-    let ret = json(handle.post(url, &body), token);
-    return ret
+fn json<T: Decodable>(req: Request, token: &str) -> T {
+    let body = exec(req, token);
+    let json = t!(str::from_utf8(body.get_body()));
+    t!(json::decode(json))
 }
 
-fn json<T: Decodable>(req: Request, token: &str) -> T {
+fn exec(req: Request, token: &str) -> Response {
     let body = t!(req.header("Authorization", &format!("token {}", token))
                      .header("User-Agent", "rust-release")
+                     .header("Accept", "application/vnd.github+json")
                      .exec());
     if body.get_code() < 200 || body.get_code() >= 300 {
         panic!("failed to get 200: {}", body);
     }
-    let json = t!(str::from_utf8(body.get_body()));
-    t!(json::decode(json))
+    body
 }
